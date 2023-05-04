@@ -93,6 +93,12 @@ class re_ranker_mmap:
         self.part_pid_begin_offsets = np.roll(tmp, 1)
         # [0, 1000, 2000, ...]
         self.part_pid_begin_offsets
+
+        # for our experiments, we assume the index has a single part/shard
+        self.all_token_ids = torch.load(os.path.join(index_path, '0.tokenids')).numpy(force=True)
+        [doclens] = self.part_doclens
+        assert isinstance(doclens, list)
+        self.doc_token_offsets = np.cumsum([0] + doclens[:-1])
     
     @staticmethod
     def _load_parts(index_path, part_doclens, dim, memtype="mmap"):
@@ -169,9 +175,14 @@ class re_ranker_mmap:
             batch_scores = self.our_rerank(query, group, gpu)
             allscores.extend(batch_scores)
         return allscores
-        
-        
-    def our_rerank_with_embeddings(self, qembs, pids, weightsQ=None, gpu=True):
+
+    def get_token_ids(self, pid: int) -> np.array:
+        """Returns the sequence of token IDs for a given passage ID."""
+        [doclens] = self.part_doclens
+        offset = self.doc_token_offsets[pid]
+        return self.all_token_ids[offset : offset + doclens[pid]]
+
+    def our_rerank_with_embeddings(self, qembs, pids, weightsQ=None, gpu=True, token_ids_to_prune=None):
         """
         input: qid,query, docid, query_tokens, query_embeddings, query_weights 
         
@@ -197,17 +208,36 @@ class re_ranker_mmap:
             self.get_embedding_copy(pid, D_, offset)
         if gpu:
             D_ = D_.cuda()
-        maxscoreQ = (Q @ D_.permute(0, 2, 1)).max(2).values.cpu()
+
+        ### Compute the MaxSim scores ###
+
+        # Compute the dot products between query and document embeddings.
+        dot_products = Q @ D_.permute(0, 2, 1)  # shape: (num_docs, query_len, max_doc_len)
+
+        if token_ids_to_prune is not None:
+            # Mask out dot products that correspond to token embeddings we're dropping.
+            # pids: dtype: int(?), shape: (num_docs,)
+            for passage_index, pid in enumerate(pids):
+                # Get the sequence of token IDs for this passage.
+                token_ids = self.get_token_ids(pid)
+
+                # Mask the tokens that are on the prune list.
+                for token_index, token_id in enumerate(token_ids):
+                    if token_id in token_ids_to_prune:
+                        dot_products[passage_index, :, token_index] = -torch.inf
+
+        maxscoreQ = dot_products.max(2).values.cpu()
         scores = (weightsQ*maxscoreQ).sum(1).cpu()
+
         return scores.tolist()
 
-    def our_rerank_with_embeddings_batched(self, qembs, pids, weightsQ=None, gpu=True, batch_size=1000):
+    def our_rerank_with_embeddings_batched(self, qembs, pids, weightsQ=None, gpu=True, batch_size=1000, token_ids_to_prune=None):
         import more_itertools
         if len(pids) < batch_size:
-            return self.our_rerank_with_embeddings(qembs, pids, weightsQ, gpu)
+            return self.our_rerank_with_embeddings(qembs, pids, weightsQ, gpu, token_ids_to_prune)
         allscores=[]
         for group in more_itertools.chunked(pids, batch_size):
-            batch_scores = self.our_rerank_with_embeddings(qembs, group, weightsQ, gpu)
+            batch_scores = self.our_rerank_with_embeddings(qembs, group, weightsQ, gpu, token_ids_to_prune)
             allscores.extend(batch_scores)
         return allscores
 
@@ -718,7 +748,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             df["docno"] = df["docid"].apply(lambda docid : self.docid2docno[docid])
         return df
 
-    def index_scorer(self, query_encoded=False, add_ranks=False, add_docnos=True, batch_size=10000) -> pt.Transformer:
+    def index_scorer(self, query_encoded=False, add_ranks=False, add_docnos=True, batch_size=10000, token_ids_to_prune=None) -> pt.Transformer:
         """
         Returns a transformer that uses the ColBERT index to perform scoring of documents to queries 
         """
@@ -759,9 +789,9 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             if "query_weights" in qid_group.columns:
                 weights = qid_group.iloc[0].query_weights
             if batch_size > 0:
-                scores = rrm.our_rerank_with_embeddings_batched(qid_group.iloc[0]["query_embs"], docids, weights, batch_size=batch_size, gpu=self.gpu)
+                scores = rrm.our_rerank_with_embeddings_batched(qid_group.iloc[0]["query_embs"], docids, weights, batch_size=batch_size, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
             else:
-                scores = rrm.our_rerank_with_embeddings(qid_group.iloc[0]["query_embs"], docids, weights, gpu=self.gpu)
+                scores = rrm.our_rerank_with_embeddings(qid_group.iloc[0]["query_embs"], docids, weights, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
             qid_group["score"] = scores
             if "docno" not in qid_group.columns and add_docnos:
                 qid_group = self._add_docnos(qid_group)
@@ -769,6 +799,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 return pt.model.add_ranks(qid_group)
             return qid_group
 
+        assert query_encoded, "For our experiments, we expect query_encoded to be True"
         if query_encoded:
             return pt.apply.by_query(rrm_scorer_query_embs) 
         return pt.apply.by_query(rrm_scorer) 
@@ -807,14 +838,14 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             all_tensors = torch.cat(all_tensors).squeeze()
         return all_tensors
 
-    def end_to_end(self) -> pt.Transformer:
+    def end_to_end(self, token_ids_to_prune=None) -> pt.Transformer:
         """
         Returns a transformer composition that uses a ColBERT FAISS index to retrieve documents, followed by a ColBERT index 
         to perform accurate scoring of the retrieved documents. Equivalent to `colbertfactory.set_retrieve() >> colbertfactory.index_scorer()`.
         """
         #input: qid, query, 
         #output: qid, query, docno, score
-        return self.set_retrieve() >> self.index_scorer(query_encoded=True)
+        return self.set_retrieve() >> self.index_scorer(query_encoded=True, token_ids_to_prune=token_ids_to_prune)
 
     def ann_retrieve_score(self, batch=False, query_encoded=False, faiss_depth=1000, verbose=False, maxsim=True, add_ranks=True, add_docnos=True, num_qembs_hint=32) -> pt.Transformer:
         """
