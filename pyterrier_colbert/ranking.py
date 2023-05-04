@@ -683,7 +683,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             self.faiss_index.faiss_index = faiss.index_cpu_to_all_gpus(self.faiss_index.faiss_index)
         return self.faiss_index
 
-    def set_retrieve(self, batch=False, query_encoded=False, faiss_depth=1000, verbose=False, docnos=False) -> pt.Transformer:
+    def set_retrieve(self, batch=False, query_encoded=False, faiss_depth=1000, verbose=False, docnos=False, token_ids_to_prune=None) -> pt.Transformer:
         """
         Performs ANN retrieval, but the retrieval forms a set - i.e. there is no score attribute. Number of documents retrieved
         is indirectly controlled by the faiss_depth parameters (denoted as k' in the original ColBERT paper).
@@ -697,7 +697,36 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         #output: qid, query, query_embs, query_toks, query_weights, docid, [docno]
         
         assert not batch
-        faiss_index = self._faiss_index()
+        import faiss
+        import copy
+        from colbert.ranking.faiss_index import FaissIndex
+
+        faiss_index: FaissIndex = self._faiss_index()
+
+        if token_ids_to_prune is not None: 
+            # Shallow clone FaissIndex object
+            faiss_index = copy.copy(faiss_index)
+            # Deep clone actual faiss_index for the shallow copy by moving from gpu to cpu mem
+            if self.faiss_index_on_gpu:
+                faiss_index.faiss_index = faiss.index_gpu_to_cpu(faiss_index.faiss_index)
+            else:
+                faiss_index.faiss_index = faiss.clone_index(faiss_index.faiss_index)
+
+            print(f"DEBUG>>> {token_ids_to_prune=}")
+
+            # Find all tokens to be removed
+            all_token_ids = self._rrm().all_token_ids   # vector id -> token id
+            vectors_ids_to_prune = np.array([i for i, token_id in enumerate(all_token_ids) if token_id in token_ids_to_prune])
+
+            print(f"DEBUG>>> {vectors_ids_to_prune=}")
+
+            print(f"DEBUG>>> pre-remove: {faiss_index.faiss_index.ntotal}")
+            faiss_index.faiss_index.remove_ids(vectors_ids_to_prune)
+            print(f"DEBUG>>> post-remove: {faiss_index.faiss_index.ntotal}")
+
+            if self.faiss_index_on_gpu: 
+                # Move back to GPU
+                faiss_index.faiss_index = faiss.index_cpu_to_all_gpus(faiss_index.faiss_index)
         
         # this is when queries have NOT already been encoded
         def _single_retrieve(queries_df):
@@ -870,7 +899,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         """
         #input: qid, query, 
         #output: qid, query, docno, score
-        return self.set_retrieve() >> self.index_scorer(query_encoded=True, token_ids_to_prune=token_ids_to_prune)
+        return self.set_retrieve(token_ids_to_prune=token_ids_to_prune) >> self.index_scorer(query_encoded=True, token_ids_to_prune=token_ids_to_prune)
 
     def ann_retrieve_score(self, batch=False, query_encoded=False, faiss_depth=1000, verbose=False, maxsim=True, add_ranks=True, add_docnos=True, num_qembs_hint=32) -> pt.Transformer:
         """
