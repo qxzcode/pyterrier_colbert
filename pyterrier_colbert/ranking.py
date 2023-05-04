@@ -568,7 +568,26 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         #we load this lazily
         self.rrm = None
         self.faiss_index = None
-        
+
+        all_token_ids = torch.load(os.path.join(self.index_path, '0.tokenids'))
+        unique_token_ids, token_id_counts = all_token_ids.unique(return_counts=True)
+        sort = torch.argsort(token_id_counts, descending=True)
+        self.unique_token_ids = unique_token_ids[sort].numpy()
+        token_id_proportions = token_id_counts[sort].numpy() / len(all_token_ids)
+        self.token_id_cumulative_proportions = np.cumsum(token_id_proportions)
+
+    def top_k_tokens(self, k: int) -> set[int]:
+        """Returns the token IDs of the k most frequent tokens in the collection."""
+        return set(self.unique_token_ids[:k])
+
+    def top_p_tokens(self, p: float) -> set[int]:
+        """
+        Returns the token IDs of the tokens that make up the top p proportion
+        (0.0 - 1.0) of most frequent terms in the collection.
+        """
+        k = np.searchsorted(self.token_id_cumulative_proportions, p) + 1
+        return self.top_k_tokens(k)
+
     # allows a colbert index to be built from a dataset
     def from_dataset(dataset : Union[str,Dataset], 
             variant : str = None, 
