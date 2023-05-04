@@ -577,16 +577,22 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         self.token_id_cumulative_proportions = np.cumsum(token_id_proportions)
 
     def top_k_tokens(self, k: int) -> set[int]:
-        """Returns the token IDs of the k most frequent tokens in the collection."""
+        """Returns the token IDs of the `k` most frequent tokens in the collection."""
         return set(self.unique_token_ids[:k])
 
     def top_p_tokens(self, p: float) -> set[int]:
         """
-        Returns the token IDs of the tokens that make up the top p proportion
+        Returns the token IDs of the tokens that make up the top `p` proportion
         (0.0 - 1.0) of most frequent terms in the collection.
         """
         k = np.searchsorted(self.token_id_cumulative_proportions, p) + 1
         return self.top_k_tokens(k)
+
+    def token_ids_to_strings(self, token_ids) -> list[str]:
+        """Converts an array-like of token IDs to token strings."""
+        tokens = self.args.inference.query_tokenizer.tok.convert_ids_to_tokens(token_ids)
+        token_map = {"[unused1]" : "[D]", "[unused0]" : "[Q]"}
+        return [token_map[t] if t in token_map else t for t in tokens]
 
     # allows a colbert index to be built from a dataset
     def from_dataset(dataset : Union[str,Dataset], 
