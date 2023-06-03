@@ -22,6 +22,7 @@ from collections import defaultdict
 import numpy as np
 import pickle
 from warnings import warn
+import functools
 
 class file_part_mmap:
     def __init__(self, file_path, file_doclens, dim):
@@ -94,9 +95,16 @@ class re_ranker_mmap:
         # [0, 1000, 2000, ...]
         self.part_pid_begin_offsets
 
-        # for our experiments, we assume the index has a single part/shard
-        self.all_token_ids = torch.load(os.path.join(index_path, '0.tokenids')).numpy(force=True)
-        [doclens] = self.part_doclens
+        # run the ranking experiment with the option of multiple shards
+        self.all_token_ids = np.zeros(sum(load_doclens(index_path, True)), dtype='int64')
+        i = 0
+        for k in range(len(self.part_doclens)):
+            next_tok_ids = torch.load(os.path.join(index_path, f'{k}.tokenids')).numpy(force=True)
+            next_i = i + len(next_tok_ids)
+            self.all_token_ids[i: next_i] = next_tok_ids
+            i = next_i
+        
+        doclens = functools.reduce(lambda a, b: a + b, self.part_doclens)
         assert isinstance(doclens, list)
         self.doc_token_offsets = np.cumsum([0] + doclens[:-1])
     
@@ -178,7 +186,7 @@ class re_ranker_mmap:
 
     def get_token_ids(self, pid: int) -> np.array:
         """Returns the sequence of token IDs for a given passage ID."""
-        [doclens] = self.part_doclens
+        doclens = functools.reduce(lambda a, b: a + b, self.part_doclens)
         offset = self.doc_token_offsets[pid]
         return self.all_token_ids[offset : offset + doclens[pid]]
 
