@@ -582,11 +582,18 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         self.rrm = None
         self.faiss_index = None
 
-        all_token_ids = torch.load(os.path.join(self.index_path, '0.tokenids'))
-        unique_token_ids, token_id_counts = all_token_ids.unique(return_counts=True)
+        self.all_token_ids = np.zeros(sum(load_doclens(self.index_path, True)), dtype='int64')
+        i = 0
+        for k in range(len(self.part_doclens)):
+            next_tok_ids = torch.load(os.path.join(self.index_path, f'{k}.tokenids'))
+            next_i = i + len(next_tok_ids)
+            self.all_token_ids[i: next_i] = next_tok_ids
+            i = next_i
+
+        unique_token_ids, token_id_counts = self.all_token_ids.unique(return_counts=True)
         sort = torch.argsort(token_id_counts, descending=True)
         self.unique_token_ids = unique_token_ids[sort].numpy()
-        token_id_proportions = token_id_counts[sort].numpy() / len(all_token_ids)
+        token_id_proportions = token_id_counts[sort].numpy() / len(self.all_token_ids)
         self.token_id_cumulative_proportions = np.cumsum(token_id_proportions)
 
     def top_k_tokens(self, k: int) -> set[int]:
