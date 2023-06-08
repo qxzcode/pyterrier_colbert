@@ -701,7 +701,9 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         # ensure the faiss_index is transferred to GPU memory for speed
         import faiss
         if self.faiss_index_on_gpu:
-            self.faiss_index.faiss_index = faiss.index_cpu_to_all_gpus(self.faiss_index.faiss_index)
+            opts = faiss.GpuMultipleClonerOptions()
+            opts.shard = True
+            self.faiss_index.faiss_index = faiss.index_cpu_to_gpus_list(self.faiss_index.faiss_index, gpus=[1,2,3], co=opts)
         return self.faiss_index
 
     def set_retrieve(self, batch=False, query_encoded=False, faiss_depth=1000, verbose=False, docnos=False, token_ids_to_prune=None) -> pt.Transformer:
