@@ -106,7 +106,7 @@ class re_ranker_mmap:
         
         doclens = functools.reduce(lambda a, b: a + b, self.part_doclens)
         assert isinstance(doclens, list)
-        self.doc_token_offsets = np.cumsum([0] + doclens[:-1])
+        self.doc_token_offsets = np.cumsum([0] + doclens)
     
     @staticmethod
     def _load_parts(index_path, part_doclens, dim, memtype="mmap"):
@@ -186,9 +186,9 @@ class re_ranker_mmap:
 
     def get_token_ids(self, pid: int) -> np.array:
         """Returns the sequence of token IDs for a given passage ID."""
-        doclens = functools.reduce(lambda a, b: a + b, self.part_doclens)
-        offset = self.doc_token_offsets[pid]
-        return self.all_token_ids[offset : offset + doclens[pid]]
+        start_offset = self.doc_token_offsets[pid]
+        end_offset = self.doc_token_offsets[pid+1]
+        return self.all_token_ids[start_offset: end_offset]
 
     def our_rerank_with_embeddings(self, qembs, pids, weightsQ=None, gpu=True, token_ids_to_prune=None):
         """
@@ -198,9 +198,7 @@ class re_ranker_mmap:
         """
         colbert = self.args.colbert
         inference = self.inference
-        # default is uniform weight for all query embeddings
-        if weightsQ is None:
-            weightsQ = torch.ones(len(qembs))
+        
         # make to 3d tensor
         Q = torch.unsqueeze(qembs, 0)
         if gpu:
@@ -218,13 +216,11 @@ class re_ranker_mmap:
             D_ = D_.cuda()
 
         ### Compute the MaxSim scores ###
-
-        # Compute the dot products between query and document embeddings.
-        dot_products = Q @ D_.permute(0, 2, 1)  # shape: (num_docs, query_len, max_doc_len)
-        # dot_products = dot_products.cpu()
-        mask = torch.zeros([dot_products.size()[0], dot_products.size()[2]], dtype=torch.uint8)
-
         if token_ids_to_prune is not None:
+            # Compute the dot products between query and document embeddings.
+            dot_products = Q @ D_.permute(0, 2, 1)  # shape: (num_docs, query_len, max_doc_len)
+            mask = torch.zeros([dot_products.size()[0], dot_products.size()[2]], dtype=torch.uint8)
+
             # Mask out dot products that correspond to token embeddings we're dropping.
             # pids: dtype: int(?), shape: (num_docs,)
             for passage_index, pid in enumerate(pids):
@@ -232,15 +228,22 @@ class re_ranker_mmap:
                 token_ids = self.get_token_ids(pid)
 
                 # Mask the tokens that are on the prune list.
-                for token_index, token_id in enumerate(token_ids):
-                    if token_id in token_ids_to_prune:
-                        # dot_products[passage_index, :, token_index] = -torch.inf
-                        mask[passage_index, token_index] = 1
-        if gpu:
-            mask = mask.cuda()
+                for token_id in token_ids_to_prune:
+                    mask[passage_index, :len(token_ids)] |= token_ids == token_id
+            if gpu:
+                mask = mask.cuda()
 
-        maxscoreQ = (dot_products.masked_fill(mask.unsqueeze(1).bool(), -torch.inf)).max(2).values.cpu()
-        scores = (weightsQ*maxscoreQ).sum(1).cpu()
+            # Compute maxscoreQ with pruned tokens masked
+            maxscoreQ = (dot_products.masked_fill(mask.unsqueeze(1).bool(), -torch.inf)).max(2).values
+        else:
+            # No pruning
+            maxscoreQ = (Q @ D_.permute(0, 2, 1)).max(2).values
+    
+        # default is uniform weight for all query embeddings
+        if weightsQ is None:
+            scores = maxscoreQ.sum(1).cpu()
+        else:
+            scores = (weightsQ*maxscoreQ).sum(1).cpu()
 
         return scores.tolist()
 
