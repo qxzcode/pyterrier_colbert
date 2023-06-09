@@ -584,6 +584,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         #we load this lazily
         self.rrm = None
         self.faiss_index = None
+        # self.saved_token_ids_to_prune = None
 
         self.all_token_ids = np.zeros(sum(load_doclens(self.index_path, flatten=True)), dtype='int64')
         i = 0
@@ -688,7 +689,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             cf=cf, df=df, mask_punctuation=self.args.mask_punctuation)
         return self._faissnn
 
-    def _faiss_index(self):
+    def _faiss_index(self, token_ids_to_prune=None):
         """
         Returns an instance of the Colbert FaissIndex class, which provides nearest neighbour information
         """
@@ -701,6 +702,17 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         if not os.path.exists(faiss_index_path):
             raise ValueError("No faiss index found at %s" % faiss_index_path)
         self.faiss_index = FaissIndex(self.index_path, faiss_index_path, self.args.nprobe, self.args.part_range, mmap=self.faisstype == 'mmap')
+
+        if token_ids_to_prune is not None:
+            # Select token ids to prune
+            all_token_ids = self._rrm().all_token_ids   # vector id -> token id
+            vectors_ids_to_prune = np.array([i for i, token_id in enumerate(all_token_ids) if token_id in token_ids_to_prune])
+
+            # Remove tokens from faiss index
+            self.faiss_index.faiss_index.remove_ids(vectors_ids_to_prune)
+
+            # self.saved_token_ids_to_prune = token_ids_to_prune
+
         # ensure the faiss_index is transferred to GPU memory for speed
         import faiss
         if self.faiss_index_on_gpu:
@@ -728,31 +740,6 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         from colbert.ranking.faiss_index import FaissIndex
 
         faiss_index: FaissIndex = self._faiss_index()
-
-        if token_ids_to_prune is not None: 
-            # Shallow clone FaissIndex object
-            faiss_index = copy.copy(faiss_index)
-            # Deep clone actual faiss_index for the shallow copy by moving from gpu to cpu mem
-            if self.faiss_index_on_gpu:
-                faiss_index.faiss_index = faiss.index_gpu_to_cpu(faiss_index.faiss_index)
-            else:
-                faiss_index.faiss_index = faiss.clone_index(faiss_index.faiss_index)
-
-            # print(f"DEBUG>>> {token_ids_to_prune=}")
-
-            # Find all tokens to be removed
-            all_token_ids = self._rrm().all_token_ids   # vector id -> token id
-            vectors_ids_to_prune = np.array([i for i, token_id in enumerate(all_token_ids) if token_id in token_ids_to_prune])
-
-            # print(f"DEBUG>>> {vectors_ids_to_prune=}")
-
-            # print(f"DEBUG>>> pre-remove: {faiss_index.faiss_index.ntotal}")
-            faiss_index.faiss_index.remove_ids(vectors_ids_to_prune)
-            # print(f"DEBUG>>> post-remove: {faiss_index.faiss_index.ntotal}")
-
-            if self.faiss_index_on_gpu: 
-                # Move back to GPU
-                faiss_index.faiss_index = faiss.index_cpu_to_all_gpus(faiss_index.faiss_index)
         
         # this is when queries have NOT already been encoded
         def _single_retrieve(queries_df):
