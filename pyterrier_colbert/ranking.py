@@ -739,7 +739,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         import copy
         from colbert.ranking.faiss_index import FaissIndex
 
-        faiss_index: FaissIndex = self._faiss_index()
+        faiss_index: FaissIndex = self._faiss_index(token_ids_to_prune=token_ids_to_prune)
         
         # this is when queries have NOT already been encoded
         def _single_retrieve(queries_df):
