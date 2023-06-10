@@ -107,6 +107,8 @@ class re_ranker_mmap:
         doclens = functools.reduce(lambda a, b: a + b, self.part_doclens)
         assert isinstance(doclens, list)
         self.doc_token_offsets = np.cumsum([0] + doclens)
+
+        self.all_token_mask = None
     
     @staticmethod
     def _load_parts(index_path, part_doclens, dim, memtype="mmap"):
@@ -189,7 +191,20 @@ class re_ranker_mmap:
         start_offset = self.doc_token_offsets[pid]
         end_offset = self.doc_token_offsets[pid+1]
         return self.all_token_ids[start_offset: end_offset]
+    
+    def get_token_mask(self, pid: int, token_ids_to_prune) -> np.array:
+        start_offset = self.doc_token_offsets[pid]
+        end_offset = self.doc_token_offsets[pid+1]
 
+        if self.all_token_mask is None:
+            # Compute new mask
+            self.all_token_mask = np.zeros(len(self.all_token_ids), dtype=bool)
+            for tok in token_ids_to_prune:
+                self.all_token_mask |= self.all_token_ids == tok
+        
+        # Return existing mask
+        return self.all_token_mask[start_offset: end_offset]
+        
     def our_rerank_with_embeddings(self, qembs, pids, weightsQ=None, gpu=True, token_ids_to_prune=None):
         """
         input: qid,query, docid, query_tokens, query_embeddings, query_weights 
@@ -228,8 +243,8 @@ class re_ranker_mmap:
                 token_ids = self.get_token_ids(pid)
 
                 # Mask the tokens that are on the prune list.
-                for token_id in token_ids_to_prune:
-                    mask[passage_index, :len(token_ids)] |= token_ids == token_id
+                mask[passage_index, :len(token_ids)] = self.get_token_mask(pid, token_ids_to_prune)
+
             if gpu:
                 mask = mask.cuda()
 
