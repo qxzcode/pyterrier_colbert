@@ -842,6 +842,17 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
 
         rrm = self._rrm()
 
+        import colbert_rs
+        rust_scorer = colbert_rs.Scorer(
+            doc_token_offsets=rrm.doc_token_offsets,
+            all_token_ids=rrm.all_token_ids,
+            doc_emb_parts=[
+                (part.startpos, part.mmap.numpy())
+                for part in rrm.part_mmap
+            ],
+            token_ids_to_prune=token_ids_to_prune,
+        )
+
         def rrm_scorer(qid_group):
             if "query_embs" in qid_group.columns:
                 warn("index_scorer() used with query_encoded=False, but query_embs column present in input. Should you use query_encoded=True?")
@@ -870,10 +881,15 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             weights = None
             if "query_weights" in qid_group.columns:
                 weights = qid_group.iloc[0].query_weights
-            if batch_size > 0:
-                scores = rrm.our_rerank_with_embeddings_batched(qid_group.iloc[0]["query_embs"], docids, weights, batch_size=batch_size, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
-            else:
-                scores = rrm.our_rerank_with_embeddings(qid_group.iloc[0]["query_embs"], docids, weights, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
+                raise RuntimeError("query_weights are not supported by our current pipeline")
+
+            query_embs = qid_group.iloc[0]["query_embs"]
+            scores = rust_scorer.score_documents(query_embs.numpy(), docids)
+            # if batch_size > 0:
+            #     scores = rrm.our_rerank_with_embeddings_batched(qid_group.iloc[0]["query_embs"], docids, weights, batch_size=batch_size, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
+            # else:
+            #     scores = rrm.our_rerank_with_embeddings(qid_group.iloc[0]["query_embs"], docids, weights, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
+
             qid_group["score"] = scores
             if "docno" not in qid_group.columns and add_docnos:
                 qid_group = self._add_docnos(qid_group)
