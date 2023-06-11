@@ -77,7 +77,7 @@ class re_ranker_mmap:
         self.part_doclens = load_doclens(index_path, flatten=False)
         assert len(self.part_doclens) > 0, "Did not find any indices at %s" % index_path
         # Local mmapped tensors with local, single file accesses
-        self.part_mmap : List[file_part_mmap] = re_ranker_mmap._load_parts(index_path, self.part_doclens, self.dim, memtype)
+        self.part_mmap : List[file_part_mem] = re_ranker_mmap._load_parts(index_path, self.part_doclens, self.dim, memtype)
         
         # last pid (inclusive, e.g., the -1) in each pt file
         # the -1 is used in the np.searchsorted
@@ -198,12 +198,12 @@ class re_ranker_mmap:
 
         if self.all_token_mask is None:
             # Compute new mask
-            self.all_token_mask = np.zeros(len(self.all_token_ids), dtype=bool)
+            self.all_token_mask = np.zeros(len(self.all_token_ids), dtype=np.uint8)
             for tok in token_ids_to_prune:
                 self.all_token_mask |= self.all_token_ids == tok
         
         # Return existing mask
-        return self.all_token_mask[start_offset: end_offset]
+        return torch.from_numpy(self.all_token_mask[start_offset:end_offset])
         
     def our_rerank_with_embeddings(self, qembs, pids, weightsQ=None, gpu=True, token_ids_to_prune=None):
         """
@@ -757,7 +757,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         faiss_index: FaissIndex = self._faiss_index(token_ids_to_prune=token_ids_to_prune)
         
         # this is when queries have NOT already been encoded
-        def _single_retrieve(queries_df):
+        def _single_retrieve(queries_df: pd.DataFrame):
             # we know that query_encoded=False
             if "query_embs" in queries_df.columns:
                 warn("set_retrieve() used with query_encoded=False, but query_embs column present in input. Should you use query_encoded=True?")
