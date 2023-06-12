@@ -201,6 +201,7 @@ class re_ranker_mmap:
             self.all_token_mask = np.zeros(len(self.all_token_ids), dtype=bool)
             for tok in token_ids_to_prune:
                 self.all_token_mask |= self.all_token_ids == tok
+            self.all_token_mask = torch.from_numpy(self.all_token_mask)
         
         # Return existing mask
         return self.all_token_mask[start_offset: end_offset]
