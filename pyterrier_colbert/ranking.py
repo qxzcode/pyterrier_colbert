@@ -753,6 +753,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         import faiss
         import copy
         from colbert.ranking.faiss_index import FaissIndex
+        from colbert_rs import RetrieveDFBuilder
 
         faiss_index: FaissIndex = self._faiss_index(token_ids_to_prune=token_ids_to_prune)
         
@@ -761,7 +762,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             # we know that query_encoded=False
             if "query_embs" in queries_df.columns:
                 warn("set_retrieve() used with query_encoded=False, but query_embs column present in input. Should you use query_encoded=True?")
-            rtr = []
+            rtr = RetrieveDFBuilder()
             iter = queries_df.itertuples()
             iter = tqdm(iter, unit="q")  if verbose else iter
             for row in iter:
@@ -770,16 +771,15 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 with torch.no_grad():
                     Q, ids, masks = self.args.inference.queryFromText([query], bsize=512, with_ids=True)
                 Q_f = Q[0:1, :, :]
-                all_pids = faiss_index.retrieve(faiss_depth, Q_f, verbose=verbose)
+                [passage_ids] = faiss_index.retrieve(faiss_depth, Q_f, verbose=verbose)
                 Q_cpu = Q[0, :, :].cpu()
-                for passage_ids in all_pids:
-                    if verbose:
-                        print("qid %s retrieved docs %d" % (qid, len(passage_ids)))
-                    for pid in passage_ids:
-                        rtr.append([qid, query, pid, ids[0], Q_cpu])
+                if verbose:
+                    print("qid %s retrieved docs %d" % (qid, len(passage_ids)))
+                rtr.append_rows(qid, query, passage_ids, ids[0], Q_cpu)
                         
             #build the DF to return for this query
-            rtrDf = pd.DataFrame(rtr, columns=["qid","query",'docid','query_toks','query_embs'] )
+            rtr = rtr.to_list()
+            rtrDf = pd.DataFrame(rtr, columns=["qid","query",'docid','query_toks','query_embs'])
             if docnos:
                 rtrDf = self._add_docnos(rtrDf)
             return rtrDf
