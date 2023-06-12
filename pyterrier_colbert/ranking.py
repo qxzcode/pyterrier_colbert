@@ -850,7 +850,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 (part.startpos, part.mmap.numpy())
                 for part in rrm.part_mmap
             ],
-            token_ids_to_prune=token_ids_to_prune,
+            token_ids_to_prune=set() if token_ids_to_prune is None else token_ids_to_prune,
         )
 
         def rrm_scorer(qid_group):
