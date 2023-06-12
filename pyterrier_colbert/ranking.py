@@ -77,7 +77,7 @@ class re_ranker_mmap:
         self.part_doclens = load_doclens(index_path, flatten=False)
         assert len(self.part_doclens) > 0, "Did not find any indices at %s" % index_path
         # Local mmapped tensors with local, single file accesses
-        self.part_mmap : List[file_part_mmap] = re_ranker_mmap._load_parts(index_path, self.part_doclens, self.dim, memtype)
+        self.part_mmap : List[file_part_mem] = re_ranker_mmap._load_parts(index_path, self.part_doclens, self.dim, memtype)
         
         # last pid (inclusive, e.g., the -1) in each pt file
         # the -1 is used in the np.searchsorted
@@ -198,13 +198,13 @@ class re_ranker_mmap:
 
         if self.all_token_mask is None:
             # Compute new mask
-            self.all_token_mask = np.zeros(len(self.all_token_ids), dtype=bool)
+            self.all_token_mask = np.zeros(len(self.all_token_ids), dtype=np.uint8)
             for tok in token_ids_to_prune:
                 self.all_token_mask |= self.all_token_ids == tok
             self.all_token_mask = torch.from_numpy(self.all_token_mask)
         
         # Return existing mask
-        return self.all_token_mask[start_offset: end_offset]
+        return torch.from_numpy(self.all_token_mask[start_offset:end_offset])
         
     def our_rerank_with_embeddings(self, qembs, pids, weightsQ=None, gpu=True, token_ids_to_prune=None):
         """
@@ -754,15 +754,16 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         import faiss
         import copy
         from colbert.ranking.faiss_index import FaissIndex
+        from colbert_rs import RetrieveDFBuilder
 
         faiss_index: FaissIndex = self._faiss_index(token_ids_to_prune=token_ids_to_prune)
         
         # this is when queries have NOT already been encoded
-        def _single_retrieve(queries_df):
+        def _single_retrieve(queries_df: pd.DataFrame):
             # we know that query_encoded=False
             if "query_embs" in queries_df.columns:
                 warn("set_retrieve() used with query_encoded=False, but query_embs column present in input. Should you use query_encoded=True?")
-            rtr = []
+            rtr = RetrieveDFBuilder()
             iter = queries_df.itertuples()
             iter = tqdm(iter, unit="q")  if verbose else iter
             for row in iter:
@@ -771,16 +772,15 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 with torch.no_grad():
                     Q, ids, masks = self.args.inference.queryFromText([query], bsize=512, with_ids=True)
                 Q_f = Q[0:1, :, :]
-                all_pids = faiss_index.retrieve(faiss_depth, Q_f, verbose=verbose)
+                [passage_ids] = faiss_index.retrieve(faiss_depth, Q_f, verbose=verbose)
                 Q_cpu = Q[0, :, :].cpu()
-                for passage_ids in all_pids:
-                    if verbose:
-                        print("qid %s retrieved docs %d" % (qid, len(passage_ids)))
-                    for pid in passage_ids:
-                        rtr.append([qid, query, pid, ids[0], Q_cpu])
+                if verbose:
+                    print("qid %s retrieved docs %d" % (qid, len(passage_ids)))
+                rtr.append_rows(qid, query, passage_ids, ids[0], Q_cpu)
                         
             #build the DF to return for this query
-            rtrDf = pd.DataFrame(rtr, columns=["qid","query",'docid','query_toks','query_embs'] )
+            rtr = rtr.to_list()
+            rtrDf = pd.DataFrame(rtr, columns=["qid","query",'docid','query_toks','query_embs'])
             if docnos:
                 rtrDf = self._add_docnos(rtrDf)
             return rtrDf
@@ -843,6 +843,17 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
 
         rrm = self._rrm()
 
+        import colbert_rs
+        rust_scorer = colbert_rs.Scorer(
+            doc_token_offsets=rrm.doc_token_offsets,
+            all_token_ids=rrm.all_token_ids,
+            doc_emb_parts=[
+                (part.startpos, part.mmap.numpy())
+                for part in rrm.part_mmap
+            ],
+            token_ids_to_prune=set() if token_ids_to_prune is None else token_ids_to_prune,
+        )
+
         def rrm_scorer(qid_group):
             if "query_embs" in qid_group.columns:
                 warn("index_scorer() used with query_encoded=False, but query_embs column present in input. Should you use query_encoded=True?")
@@ -871,10 +882,15 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             weights = None
             if "query_weights" in qid_group.columns:
                 weights = qid_group.iloc[0].query_weights
-            if batch_size > 0:
-                scores = rrm.our_rerank_with_embeddings_batched(qid_group.iloc[0]["query_embs"], docids, weights, batch_size=batch_size, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
-            else:
-                scores = rrm.our_rerank_with_embeddings(qid_group.iloc[0]["query_embs"], docids, weights, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
+                raise RuntimeError("query_weights are not supported by our current pipeline")
+
+            query_embs = qid_group.iloc[0]["query_embs"]
+            scores = rust_scorer.score_documents(query_embs.numpy(), docids)
+            # if batch_size > 0:
+            #     scores = rrm.our_rerank_with_embeddings_batched(qid_group.iloc[0]["query_embs"], docids, weights, batch_size=batch_size, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
+            # else:
+            #     scores = rrm.our_rerank_with_embeddings(qid_group.iloc[0]["query_embs"], docids, weights, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
+
             qid_group["score"] = scores
             if "docno" not in qid_group.columns and add_docnos:
                 qid_group = self._add_docnos(qid_group)
