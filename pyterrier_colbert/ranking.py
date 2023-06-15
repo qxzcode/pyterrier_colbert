@@ -737,7 +737,17 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             self.faiss_index.faiss_index = faiss.index_cpu_to_gpus_list(self.faiss_index.faiss_index, gpus=[1,2,3], co=opts)
         return self.faiss_index
 
-    def set_retrieve(self, batch=False, query_encoded=False, faiss_depth=1000, verbose=False, docnos=False, token_ids_to_prune=None) -> pt.Transformer:
+    def set_retrieve(
+        self,
+        batch=False,
+        query_encoded=False,
+        faiss_depth=1000,
+        verbose=False,
+        docnos=False,
+        token_ids_to_prune=None,
+        prune_queries=False,
+        prune_documents=True,
+    ) -> pt.Transformer:
         """
         Performs ANN retrieval, but the retrieval forms a set - i.e. there is no score attribute. Number of documents retrieved
         is indirectly controlled by the faiss_depth parameters (denoted as k' in the original ColBERT paper).
@@ -756,7 +766,9 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         from colbert.ranking.faiss_index import FaissIndex
         from colbert_rs import RetrieveDFBuilder
 
-        faiss_index: FaissIndex = self._faiss_index(token_ids_to_prune=token_ids_to_prune)
+        faiss_index: FaissIndex = self._faiss_index(
+            token_ids_to_prune=token_ids_to_prune if prune_documents else None
+        )
         
         # this is when queries have NOT already been encoded
         def _single_retrieve(queries_df: pd.DataFrame):
@@ -770,13 +782,25 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 qid = row.qid
                 query = row.query
                 with torch.no_grad():
-                    Q, ids, masks = self.args.inference.queryFromText([query], bsize=512, with_ids=True)
+                    Q, q_tok_ids, masks = self.args.inference.queryFromText([query], bsize=512, with_ids=True)
+                q_tok_ids = q_tok_ids[0].cpu()
                 Q_f = Q[0:1, :, :]
+
+                if prune_queries:
+                    MASK_token_id = 103
+                    q_tok_ids_padded = torch.full((32,), fill_value=MASK_token_id)
+                    q_tok_ids_padded[:len(q_tok_ids)] = q_tok_ids
+                    query_token_mask = [tid.item() not in token_ids_to_prune for tid in q_tok_ids_padded]
+
+                    q_tok_ids = q_tok_ids[query_token_mask[:len(q_tok_ids)]]
+                    query_token_mask = torch.tensor(query_token_mask, device=Q_f.device)
+                    Q_f = Q_f[:, query_token_mask, :]
+
                 [passage_ids] = faiss_index.retrieve(faiss_depth, Q_f, verbose=verbose)
-                Q_cpu = Q[0, :, :].cpu()
+                Q_cpu = Q_f.squeeze(0).cpu()
                 if verbose:
                     print("qid %s retrieved docs %d" % (qid, len(passage_ids)))
-                rtr.append_rows(qid, query, passage_ids, ids[0], Q_cpu)
+                rtr.append_rows(qid, query, passage_ids, q_tok_ids, Q_cpu)
                         
             #build the DF to return for this query
             rtr = rtr.to_list()
@@ -831,7 +855,16 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             df["docno"] = df["docid"].apply(lambda docid : self.docid2docno[docid])
         return df
 
-    def index_scorer(self, query_encoded=False, add_ranks=False, add_docnos=True, batch_size=10000, token_ids_to_prune=None) -> pt.Transformer:
+    def index_scorer(
+        self,
+        query_encoded=False,
+        add_ranks=False,
+        add_docnos=True,
+        batch_size=10000,
+        token_ids_to_prune=None,
+        prune_queries=False,
+        prune_documents=True,
+    ) -> pt.Transformer:
         """
         Returns a transformer that uses the ColBERT index to perform scoring of documents to queries 
         """
@@ -852,6 +885,8 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 for part in rrm.part_mmap
             ],
             token_ids_to_prune=set() if token_ids_to_prune is None else token_ids_to_prune,
+            prune_queries=prune_queries,
+            prune_documents=prune_documents,
         )
 
         def rrm_scorer(qid_group):
@@ -885,7 +920,8 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 raise RuntimeError("query_weights are not supported by our current pipeline")
 
             query_embs = qid_group.iloc[0]["query_embs"]
-            scores = rust_scorer.score_documents(query_embs.numpy(), docids)
+            query_toks = qid_group.iloc[0]["query_toks"]
+            scores = rust_scorer.score_documents(query_embs.numpy(), query_toks.numpy(), docids)
             # if batch_size > 0:
             #     scores = rrm.our_rerank_with_embeddings_batched(qid_group.iloc[0]["query_embs"], docids, weights, batch_size=batch_size, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
             # else:
@@ -937,14 +973,25 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             all_tensors = torch.cat(all_tensors).squeeze()
         return all_tensors
 
-    def end_to_end(self, token_ids_to_prune=None) -> pt.Transformer:
+    def end_to_end(self, token_ids_to_prune=None, prune_queries=False, prune_documents=True) -> pt.Transformer:
         """
         Returns a transformer composition that uses a ColBERT FAISS index to retrieve documents, followed by a ColBERT index 
         to perform accurate scoring of the retrieved documents. Equivalent to `colbertfactory.set_retrieve() >> colbertfactory.index_scorer()`.
         """
         #input: qid, query, 
         #output: qid, query, docno, score
-        return self.set_retrieve(token_ids_to_prune=token_ids_to_prune) >> self.index_scorer(query_encoded=True, token_ids_to_prune=token_ids_to_prune)
+        retrieval_stage = self.set_retrieve(
+            token_ids_to_prune=token_ids_to_prune,
+            prune_queries=prune_queries,
+            prune_documents=prune_documents,
+        )
+        scoring_stage = self.index_scorer(
+            query_encoded=True,
+            token_ids_to_prune=token_ids_to_prune,
+            prune_queries=False,  # query embeddings are already pruned in the retrieval stage
+            prune_documents=prune_documents,
+        )
+        return retrieval_stage >> scoring_stage
 
     def ann_retrieve_score(self, batch=False, query_encoded=False, faiss_depth=1000, verbose=False, maxsim=True, add_ranks=True, add_docnos=True, num_qembs_hint=32) -> pt.Transformer:
         """
