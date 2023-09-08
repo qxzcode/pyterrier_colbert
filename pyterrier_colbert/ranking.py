@@ -365,7 +365,8 @@ class ColBERTModelOnlyFactory():
     def _explain(self, query, embsD, idsD):
         embsQ, idsQ, masksQ = self.args.inference.queryFromText([query], with_ids=True)
 
-        interaction = (embsQ[0] @ embsD[0].T).cpu().numpy().T
+        interaction = (embsQ.squeeze(0).cpu() @ embsD.T.cpu()).numpy().T
+        return idsQ, idsD, embsQ, embsD, interaction
         
         import numpy as np
         import matplotlib.pyplot as plt
