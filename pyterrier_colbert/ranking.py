@@ -748,6 +748,12 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         token_ids_to_prune=None,
         prune_queries=False,
         prune_documents=True,
+        remap_special_toks=False,
+        remap_masks=False,
+        replace_q=None,
+        keep_tok=None,
+        keep_pos=None,
+        remove_masks=None,
     ) -> pt.Transformer:
         """
         Performs ANN retrieval, but the retrieval forms a set - i.e. there is no score attribute. Number of documents retrieved
@@ -779,20 +785,77 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             rtr = RetrieveDFBuilder()
             iter = queries_df.itertuples()
             iter = tqdm(iter, unit="q")  if verbose else iter
+            PAD, _Q, CLS, SEP, MASK = (0, 1, 101, 102, 103)
+            bsize = 512
             for row in iter:
                 qid = row.qid
                 query = row.query
+
+                # Convert query text to tokens (CLS, QUERY_TEXT, SEP, MASKS)
+                batches = self.args.inference.query_tokenizer.tensorize([query], bsize=bsize)
+
+                if remove_masks is not None:
+                    for (input_ids, _) in batches:
+                        q_tok_ids = input_ids[0]
+                        sep_index = torch.where(q_tok_ids.squeeze() == SEP)[0].item()
+                        num_masks = 32 - (sep_index + 1)
+                        if remove_masks == "half":
+                            masks_to_remove = num_masks // 2
+                        elif remove_masks == "all":
+                            masks_to_remove = num_masks 
+                        replace_idxs = list(range(sep_index + 1, 32 - masks_to_remove))
+                        
+                        for (input_ids, _) in batches:
+                            for i in replace_idxs:
+                                input_ids[0][i] = PAD
+
+                if replace_q:
+                    input_ids[0][1] = replace_q
+
                 with torch.no_grad():
-                    Q, q_tok_ids, masks = self.args.inference.queryFromText([query], bsize=512, with_ids=True)
+                    batchesEmbs = [self.args.inference.query(input_ids, attention_mask, to_cpu=False) for input_ids, attention_mask in batches]
+                    Q, q_tok_ids, masks = (torch.cat(batchesEmbs), torch.cat([ids for ids, _ in batches]), torch.cat([masks for _, masks in batches]))
+
                 q_tok_ids = q_tok_ids[0].cpu()
                 Q_f = Q[0:1, :, :]
 
+                if remap_special_toks or remap_masks:
+                    assert not (remap_special_toks and remap_masks) # Only one of these should be true
+                    # If remapping all special tokens, we also include SEP, Q, and CLS. Otherwise, we only remap MASKs.
+                    sep_index = torch.where(q_tok_ids.squeeze() == SEP)[0].item()
+                    if remap_special_toks:
+                        remap_idxs = [0, 1] + list(range(sep_index, 32))
+                    else:
+                        remap_idxs = list(range(sep_index + 1, 32))
+                    
+                    remap_mask = torch.zeros(32, device=Q_f.device, dtype=torch.bool)
+                    for remap_idx in remap_idxs:
+                        remap_mask[remap_idx] = True
+                    dists = Q_f[0] @ Q_f[0].T # Shape: (32, 32)
+                    dists = torch.masked_fill(dists, remap_mask, -float("inf"))
+                    mapped_tok_idxs = torch.argmax(dists, 1)
+                    for i in remap_idxs:
+                        Q_f[0][i] = Q_f[0][mapped_tok_idxs[i]]
+                        q_tok_ids[i] = q_tok_ids[mapped_tok_idxs[i]]
+
                 if prune_queries:
-                    MASK_token_id = 103
+                    MASK_token_id = MASK
                     q_tok_ids_padded = torch.full((32,), fill_value=MASK_token_id)
                     q_tok_ids_padded[:len(q_tok_ids)] = q_tok_ids
                     query_token_mask = [tid.item() not in token_ids_to_prune for tid in q_tok_ids_padded]
 
+                    q_tok_ids = q_tok_ids[query_token_mask[:len(q_tok_ids)]]
+                    query_token_mask = torch.tensor(query_token_mask, device=Q_f.device)
+                    Q_f = Q_f[:, query_token_mask, :]
+
+                tok_to_keep = None
+                if keep_tok:
+                    tok_to_keep = torch.where(q_tok_ids.squeeze() == keep_tok)[0].item()
+                if keep_pos:
+                    tok_to_keep = keep_pos
+                if tok_to_keep is not None:
+                    query_token_mask = [False] * 32
+                    query_token_mask[tok_to_keep] = True
                     q_tok_ids = q_tok_ids[query_token_mask[:len(q_tok_ids)]]
                     query_token_mask = torch.tensor(query_token_mask, device=Q_f.device)
                     Q_f = Q_f[:, query_token_mask, :]
@@ -812,7 +875,6 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
 
         # this is when queries have already been encoded
         def _single_retrieve_qembs(queries_df):
-
             rtr = []
             query_weights = "query_weights" in queries_df.columns
             iter = queries_df.itertuples()
@@ -830,7 +892,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                            rtr.append([qid, row.query, pid, row.query_toks, row.query_embs, row.query_weights])
                         else:
                            rtr.append([qid, row.query, pid, row.query_toks, row.query_embs])
-            
+
             #build the DF to return for this query
             cols = ["qid","query",'docid','query_toks','query_embs']
             if query_weights:
@@ -865,6 +927,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         token_ids_to_prune=None,
         prune_queries=False,
         prune_documents=True,
+        remap_special_toks=False,
     ) -> pt.Transformer:
         """
         Returns a transformer that uses the ColBERT index to perform scoring of documents to queries 
@@ -920,8 +983,9 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 weights = qid_group.iloc[0].query_weights
                 raise RuntimeError("query_weights are not supported by our current pipeline")
 
-            query_embs = qid_group.iloc[0]["query_embs"]
-            query_toks = qid_group.iloc[0]["query_toks"]
+            query_embs = qid_group.iloc[0]["query_embs"] # Shape: (32, emb_dim)
+            query_toks = qid_group.iloc[0]["query_toks"] # Shape: (32)
+            
             scores = rust_scorer.score_documents(query_embs.numpy(), query_toks.numpy(), docids)
             # if batch_size > 0:
             #     scores = rrm.our_rerank_with_embeddings_batched(qid_group.iloc[0]["query_embs"], docids, weights, batch_size=batch_size, gpu=self.gpu, token_ids_to_prune=token_ids_to_prune)
@@ -974,7 +1038,18 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             all_tensors = torch.cat(all_tensors).squeeze()
         return all_tensors
 
-    def end_to_end(self, token_ids_to_prune=None, prune_queries=False, prune_documents=True) -> pt.Transformer:
+    def end_to_end(
+            self,
+            token_ids_to_prune=None,
+            prune_queries=False,
+            prune_documents=True,
+            remap_special_toks=False,
+            remap_masks=False,
+            replace_q=None,
+            keep_tok=None,
+            keep_pos=None,
+            remove_masks=None,
+        ) -> pt.Transformer:
         """
         Returns a transformer composition that uses a ColBERT FAISS index to retrieve documents, followed by a ColBERT index 
         to perform accurate scoring of the retrieved documents. Equivalent to `colbertfactory.set_retrieve() >> colbertfactory.index_scorer()`.
@@ -985,6 +1060,12 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             token_ids_to_prune=token_ids_to_prune,
             prune_queries=prune_queries,
             prune_documents=prune_documents,
+            remap_special_toks=remap_special_toks,
+            remap_masks=remap_masks,
+            replace_q=replace_q,
+            keep_tok=keep_tok,
+            keep_pos=keep_pos,
+            remove_masks=remove_masks,
         )
         scoring_stage = self.index_scorer(
             query_encoded=True,
