@@ -752,6 +752,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         replace_q=None,
         keep_tok=None,
         keep_pos=None,
+        remove_masks=None,
     ) -> pt.Transformer:
         """
         Performs ANN retrieval, but the retrieval forms a set - i.e. there is no score attribute. Number of documents retrieved
@@ -783,21 +784,36 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             rtr = RetrieveDFBuilder()
             iter = queries_df.itertuples()
             iter = tqdm(iter, unit="q")  if verbose else iter
+            PAD, _Q, CLS, SEP, MASK = (0, 1, 101, 102, 103)
+            bsize = 512
             for row in iter:
                 qid = row.qid
                 query = row.query
 
-                with torch.no_grad():
-                    bsize = 512
-                    if replace_q:
-                        # This is lifted from `queryFromText`'s function body.
-                        batches = self.args.inference.query_tokenizer.tensorize([query], bsize=bsize)
+                # Convert query text to tokens (CLS, QUERY_TEXT, SEP, MASKS)
+                batches = self.args.inference.query_tokenizer.tensorize([query], bsize=bsize)
+
+                if remove_masks is not None:
+                    for (input_ids, _) in batches:
+                        q_tok_ids = input_ids[0]
+                        sep_index = torch.where(q_tok_ids.squeeze() == SEP)[0].item()
+                        num_masks = 32 - (sep_index + 1)
+                        if remove_masks == "half":
+                            masks_to_remove = num_masks // 2
+                        elif remove_masks == "all":
+                            masks_to_remove = num_masks 
+                        replace_idxs = list(range(sep_index + 1, 32 - masks_to_remove))
+                        
                         for (input_ids, _) in batches:
-                            input_ids[0][1] = replace_q
-                        batchesEmbs = [self.args.inference.query(input_ids, attention_mask, to_cpu=False) for input_ids, attention_mask in batches]
-                        Q, q_tok_ids, masks = (torch.cat(batchesEmbs), torch.cat([ids for ids, _ in batches]), torch.cat([masks for _, masks in batches]))
-                    else:
-                        Q, q_tok_ids, masks = self.args.inference.queryFromText([query], bsize=bsize, with_ids=True)
+                            for i in replace_idxs:
+                                input_ids[0][i] = PAD
+
+                if replace_q:
+                    input_ids[0][1] = replace_q
+
+                with torch.no_grad():
+                    batchesEmbs = [self.args.inference.query(input_ids, attention_mask, to_cpu=False) for input_ids, attention_mask in batches]
+                    Q, q_tok_ids, masks = (torch.cat(batchesEmbs), torch.cat([ids for ids, _ in batches]), torch.cat([masks for _, masks in batches]))
 
                 q_tok_ids = q_tok_ids[0].cpu()
                 Q_f = Q[0:1, :, :]
@@ -805,7 +821,6 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 if remap_special_toks or remap_masks:
                     assert not (remap_special_toks and remap_masks) # Only one of these should be true
                     # If remapping all special tokens, we also include SEP, Q, and CLS. Otherwise, we only remap MASKs.
-                    _Q, CLS, SEP, MASK = (1, 101, 102, 103)
                     sep_index = torch.where(q_tok_ids.squeeze() == SEP)[0].item()
                     if remap_special_toks:
                         remap_idxs = [0, 1] + list(range(sep_index, 32))
@@ -823,7 +838,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                         q_tok_ids[i] = q_tok_ids[mapped_tok_idxs[i]]
 
                 if prune_queries:
-                    MASK_token_id = 103
+                    MASK_token_id = MASK
                     q_tok_ids_padded = torch.full((32,), fill_value=MASK_token_id)
                     q_tok_ids_padded[:len(q_tok_ids)] = q_tok_ids
                     query_token_mask = [tid.item() not in token_ids_to_prune for tid in q_tok_ids_padded]
@@ -1032,6 +1047,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             replace_q=None,
             keep_tok=None,
             keep_pos=None,
+            remove_masks=None,
         ) -> pt.Transformer:
         """
         Returns a transformer composition that uses a ColBERT FAISS index to retrieve documents, followed by a ColBERT index 
@@ -1048,6 +1064,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             replace_q=replace_q,
             keep_tok=keep_tok,
             keep_pos=keep_pos,
+            remove_masks=remove_masks,
         )
         scoring_stage = self.index_scorer(
             query_encoded=True,
