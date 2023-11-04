@@ -7,7 +7,7 @@ assert pt.started(), "please run pt.init() before importing pyt_colbert"
 
 from pyterrier import tqdm
 from pyterrier.datasets import Dataset
-from typing import Union, Tuple
+from typing import *
 from colbert.evaluation.load_model import load_model
 from . import load_checkpoint
 # monkeypatch to use our downloading version
@@ -747,11 +747,8 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         token_ids_to_prune=None,
         prune_queries=False,
         prune_documents=True,
-        remap_special_toks=False,
-        remap_masks=False,
-        replace_q=None,
-        keep_tok=None,
-        keep_pos=None,
+        mod_qtoks=Optional[Callable[[torch.Tensor], torch.Tensor]],
+        mod_qembs=Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]],
     ) -> pt.Transformer:
         """
         Performs ANN retrieval, but the retrieval forms a set - i.e. there is no score attribute. Number of documents retrieved
@@ -774,7 +771,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         faiss_index: FaissIndex = self._faiss_index(
             token_ids_to_prune=token_ids_to_prune if prune_documents else None
         )
-        
+            
         # this is when queries have NOT already been encoded
         def _single_retrieve(queries_df: pd.DataFrame):
             # we know that query_encoded=False
@@ -787,40 +784,20 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                 qid = row.qid
                 query = row.query
 
+                # Contextualization happens here
                 with torch.no_grad():
                     bsize = 512
-                    if replace_q:
-                        # This is lifted from `queryFromText`'s function body.
-                        batches = self.args.inference.query_tokenizer.tensorize([query], bsize=bsize)
-                        for (input_ids, _) in batches:
-                            input_ids[0][1] = replace_q
-                        batchesEmbs = [self.args.inference.query(input_ids, attention_mask, to_cpu=False) for input_ids, attention_mask in batches]
-                        Q, q_tok_ids, masks = (torch.cat(batchesEmbs), torch.cat([ids for ids, _ in batches]), torch.cat([masks for _, masks in batches]))
-                    else:
-                        Q, q_tok_ids, masks = self.args.inference.queryFromText([query], bsize=bsize, with_ids=True)
+                    # This is lifted from `queryFromText`'s function body.
+                    batches = self.args.inference.query_tokenizer.tensorize([query], bsize=bsize)
+                    for (input_ids, _) in batches:
+                        input_ids[0] = mod_qtoks(input_ids[0])
+                    batchesEmbs = [self.args.inference.query(input_ids, attention_mask, to_cpu=False) for input_ids, attention_mask in batches]
+                    Q, q_tok_ids, _ = (torch.cat(batchesEmbs), torch.cat([ids for ids, _ in batches]), torch.cat([masks for _, masks in batches]))
 
                 q_tok_ids = q_tok_ids[0].cpu()
                 Q_f = Q[0:1, :, :]
 
-                if remap_special_toks or remap_masks:
-                    assert not (remap_special_toks and remap_masks) # Only one of these should be true
-                    # If remapping all special tokens, we also include SEP, Q, and CLS. Otherwise, we only remap MASKs.
-                    _Q, CLS, SEP, MASK = (1, 101, 102, 103)
-                    sep_index = torch.where(q_tok_ids.squeeze() == SEP)[0].item()
-                    if remap_special_toks:
-                        remap_idxs = [0, 1] + list(range(sep_index, 32))
-                    else:
-                        remap_idxs = list(range(sep_index + 1, 32))
-                    
-                    remap_mask = torch.zeros(32, device=Q_f.device, dtype=torch.bool)
-                    for remap_idx in remap_idxs:
-                        remap_mask[remap_idx] = True
-                    dists = Q_f[0] @ Q_f[0].T # Shape: (32, 32)
-                    dists = torch.masked_fill(dists, remap_mask, -float("inf"))
-                    mapped_tok_idxs = torch.argmax(dists, 1)
-                    for i in remap_idxs:
-                        Q_f[0][i] = Q_f[0][mapped_tok_idxs[i]]
-                        q_tok_ids[i] = q_tok_ids[mapped_tok_idxs[i]]
+                q_tok_ids, Q_f[0] = mod_qembs(q_tok_ids, Q_f[0])
 
                 if prune_queries:
                     MASK_token_id = 103
@@ -828,18 +805,6 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                     q_tok_ids_padded[:len(q_tok_ids)] = q_tok_ids
                     query_token_mask = [tid.item() not in token_ids_to_prune for tid in q_tok_ids_padded]
 
-                    q_tok_ids = q_tok_ids[query_token_mask[:len(q_tok_ids)]]
-                    query_token_mask = torch.tensor(query_token_mask, device=Q_f.device)
-                    Q_f = Q_f[:, query_token_mask, :]
-
-                tok_to_keep = None
-                if keep_tok:
-                    tok_to_keep = torch.where(q_tok_ids.squeeze() == keep_tok)[0].item()
-                if keep_pos:
-                    tok_to_keep = keep_pos
-                if tok_to_keep is not None:
-                    query_token_mask = [False] * 32
-                    query_token_mask[tok_to_keep] = True
                     q_tok_ids = q_tok_ids[query_token_mask[:len(q_tok_ids)]]
                     query_token_mask = torch.tensor(query_token_mask, device=Q_f.device)
                     Q_f = Q_f[:, query_token_mask, :]
@@ -1025,17 +990,17 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
     def end_to_end(
             self,
             token_ids_to_prune=None,
-            prune_queries=False,
             prune_documents=True,
-            remap_special_toks=False,
-            remap_masks=False,
-            replace_q=None,
-            keep_tok=None,
-            keep_pos=None,
+            prune_queries=False,
+            mod_qtoks=Optional[Callable[[torch.tensor], torch.tensor]],
+            mod_qembs=Optional[Callable[[torch.tensor, torch.tensor], torch.tensor]],
         ) -> pt.Transformer:
         """
         Returns a transformer composition that uses a ColBERT FAISS index to retrieve documents, followed by a ColBERT index 
         to perform accurate scoring of the retrieved documents. Equivalent to `colbertfactory.set_retrieve() >> colbertfactory.index_scorer()`.
+
+        `mod_qtoks` is a function that modifies query tokens BEFORE contextualization.
+        `mod_qembs` is a function that modifies query embeddigns AFTER contextualization.
         """
         #input: qid, query, 
         #output: qid, query, docno, score
@@ -1043,11 +1008,8 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             token_ids_to_prune=token_ids_to_prune,
             prune_queries=prune_queries,
             prune_documents=prune_documents,
-            remap_special_toks=remap_special_toks,
-            remap_masks=remap_masks,
-            replace_q=replace_q,
-            keep_tok=keep_tok,
-            keep_pos=keep_pos,
+            mod_qtoks=mod_qtoks,
+            mod_qembs=mod_qembs,
         )
         scoring_stage = self.index_scorer(
             query_encoded=True,
