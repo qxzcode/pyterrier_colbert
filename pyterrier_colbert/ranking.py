@@ -747,8 +747,8 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
         token_ids_to_prune=None,
         prune_queries=False,
         prune_documents=True,
-        mod_qtoks=Optional[Callable[[torch.Tensor], torch.Tensor]],
-        mod_qembs=Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]],
+        mod_qtoks: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        mod_qembs: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
     ) -> pt.Transformer:
         """
         Performs ANN retrieval, but the retrieval forms a set - i.e. there is no score attribute. Number of documents retrieved
@@ -789,15 +789,17 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                     bsize = 512
                     # This is lifted from `queryFromText`'s function body.
                     batches = self.args.inference.query_tokenizer.tensorize([query], bsize=bsize)
-                    for (input_ids, _) in batches:
-                        input_ids[0] = mod_qtoks(input_ids[0])
+                    if mod_qtoks:
+                        for (input_ids, _) in batches:
+                            input_ids[0] = mod_qtoks(input_ids[0])
                     batchesEmbs = [self.args.inference.query(input_ids, attention_mask, to_cpu=False) for input_ids, attention_mask in batches]
                     Q, q_tok_ids, _ = (torch.cat(batchesEmbs), torch.cat([ids for ids, _ in batches]), torch.cat([masks for _, masks in batches]))
 
                 q_tok_ids = q_tok_ids[0].cpu()
                 Q_f = Q[0:1, :, :]
 
-                q_tok_ids, Q_f[0] = mod_qembs(q_tok_ids, Q_f[0])
+                if mod_qembs:
+                    q_tok_ids, Q_f[0] = mod_qembs(q_tok_ids, Q_f[0])
 
                 if prune_queries:
                     MASK_token_id = 103
@@ -992,8 +994,8 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             token_ids_to_prune=None,
             prune_documents=True,
             prune_queries=False,
-            mod_qtoks=Optional[Callable[[torch.tensor], torch.tensor]],
-            mod_qembs=Optional[Callable[[torch.tensor, torch.tensor], torch.tensor]],
+            mod_qtoks: Optional[Callable[[torch.tensor], torch.tensor]]=None,
+            mod_qembs: Optional[Callable[[torch.tensor, torch.tensor], torch.tensor]]=None,
         ) -> pt.Transformer:
         """
         Returns a transformer composition that uses a ColBERT FAISS index to retrieve documents, followed by a ColBERT index 
