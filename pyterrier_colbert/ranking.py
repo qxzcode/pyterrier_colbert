@@ -365,7 +365,8 @@ class ColBERTModelOnlyFactory():
     def _explain(self, query, embsD, idsD):
         embsQ, idsQ, masksQ = self.args.inference.queryFromText([query], with_ids=True)
 
-        interaction = (embsQ[0] @ embsD[0].T).cpu().numpy().T
+        interaction = (embsQ.squeeze(0).cpu() @ embsD.T.cpu()).numpy().T
+        return idsQ, idsD, embsQ, embsD, interaction
         
         import numpy as np
         import matplotlib.pyplot as plt
@@ -780,6 +781,8 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             rtr = RetrieveDFBuilder()
             iter = queries_df.itertuples()
             iter = tqdm(iter, unit="q")  if verbose else iter
+            PAD, _Q, CLS, SEP, MASK = (0, 1, 101, 102, 103)
+            bsize = 512
             for row in iter:
                 qid = row.qid
                 query = row.query
@@ -802,7 +805,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
                     q_tok_ids, Q_f[0] = mod_qembs(q_tok_ids, Q_f[0])
 
                 if prune_queries:
-                    MASK_token_id = 103
+                    MASK_token_id = MASK
                     q_tok_ids_padded = torch.full((32,), fill_value=MASK_token_id)
                     q_tok_ids_padded[:len(q_tok_ids)] = q_tok_ids
                     query_token_mask = [tid.item() not in token_ids_to_prune for tid in q_tok_ids_padded]
